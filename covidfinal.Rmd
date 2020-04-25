@@ -1,0 +1,297 @@
+---
+title: "Are Small Business Closures Curbing the Spread of COVID?"
+author: "Amanda Steigman and Alex Campili"
+date: "4/24/2020"
+output: html_document
+---
+
+The following code is used for an analysis on the impact of small business closures on the spread of coronavirus in major US cities. The code provided includes all cleaning and analyses performed. Output is also provided below. 
+
+```{r}
+
+## ----- SET-UP -----
+
+## load required packages
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(MASS)
+library(cluster)
+
+## ----- Data Processing -----
+
+## load in required datasets
+census_crosswalk <- read_excel("census_crosswalk.xlsx", range = "A4:L1866")
+covid <- read.csv("us-counties_423.csv")
+small_biz_hrs <- read_excel("COVID small biz_423.xlsx", sheet = "Hours worked", range = "A2:BB53")
+small_biz_open <- read_excel("COVID small biz_423.xlsx", sheet = "Businesses open", range = "A2:BB53")
+small_biz_emp <- read_excel("COVID small biz_423.xlsx", sheet = "Employees working", range = "A2:BB53")
+census_pop <- read_excel("cbsa-met-est2019-annres.xlsx", range = "A4:M421")
+
+## aggregate COVID data to MSA
+## subset crosswalk to rows we have in SB data
+small_biz_cities <- small_biz_hrs$...1[2:51]
+small_biz_states <- c("Georgia", "Texas", "Maryland", "Alabama", "Massachusetts", "New York", 
+                      "North Carolina", "Illinois", "Ohio", "Ohio", "Ohio", "Texas", "Colorado",
+                      "Michigan", "Connecticut", "Texas", "Indiana", "Florida", "Missouri", "Nevada",
+                      "California", "Kentucky", "Tennessee", "Florida", "Wisconsin", "Minnesota",
+                      "Tennessee", "Louisiana", "New York", "Oklahoma", "Florida", "Pennsylvania", 
+                      "Arizona", "Pennsylvania", "Oregon", "Rhode Island", "North Carolina", "Virginia",
+                      "California", "California", "Utah", "Texas", "California", "California", "California",
+                      "Washington", "Missouri", "Florida", "Virginia", "Washington D.C.")
+
+## create datafrmae of cities and states based on small business data
+small_biz_dat <- data.frame(City = small_biz_cities, State = small_biz_states)
+
+## reformat/extract city from census county information and add to census dataframe
+city <- gsub("/.*$", "", gsub(",.*$", "", gsub("-.*$", "", census_crosswalk$`CBSA Title`)))
+census_crosswalk$city <- city
+## reformat/extract county from census dataset
+census_crosswalk$county <- gsub(" .*$", "", census_crosswalk$`Component Name`)
+
+## match census data to coronavirus data in order to assign a city to county-level coronavirus data
+cities <- c()
+for (i in 1:nrow(covid)){
+  t <- census_crosswalk$city[which(paste(covid$county[i], covid$state[i]) == paste(census_crosswalk$county, 
+                                                                                   census_crosswalk$State))]
+  if (identical(t, character(0))){
+    cities[i] <- 0
+  } else {
+    cities[i] <- t
+  }
+}
+## add city variable to coronavirus dataset
+covid$city <- cities
+## remove cities in coronavirus dataset for which we do not have small-business data
+## reformat dates and aggregate total cases and deaths at the city level
+covid_reduced <- covid[covid$city %in% small_biz_dat$City,]
+covid_reduced$date <- as.Date(covid_reduced$date)
+covid_reduced <- covid_reduced[covid_reduced$date >= as.Date("2020-03-01"),]
+covid_agg <- covid_reduced %>%
+  group_by(city, date) %>%
+  summarise(total_cases=sum(cases),
+            total_deaths=sum(deaths))
+
+## create vectors of unique dates and cities
+dts <- unique(small_biz_emp_long$date)
+city_u <- unique(covid_agg$city)
+
+## original covid dataset does not include dates for which there are 0 cases
+## first create rows to covid data such that all dates from small businesses are 
+## included with total cases and total deaths = 0
+sup_covid_dat <- list()
+j=1
+for (i in 1:length(city_u)){
+  tmp_dat <- covid_agg[covid_agg$city == city_u[i],]
+  if (min(tmp_dat$date) > min(dts)){
+    dts_new <- setdiff(dts, tmp_dat$date)
+    n <- length(dts_new)
+    new_dat <- data.frame(city = rep(city_u[i], n),
+                          date = as.Date(dts_new, origin = "1970-01-01"),
+                          total_cases = rep(0, n),
+                          total_deaths = rep(0, n))
+    sup_covid_dat[[j]] <- new_dat
+    j = j + 1
+  }
+}
+## bind these new rows and reformat
+leftovers <- do.call(rbind, sup_covid_dat)
+leftovers$city<- as.character(leftovers$city)
+leftovers <- as.data.frame(leftovers)
+## ensure types match and bind the aggregated covid data with new rows
+covid_agg$total_cases <- as.numeric(covid_agg$total_cases)
+covid_agg$total_deaths <- as.numeric(covid_agg$total_deaths)
+covid_agg <- rbind.data.frame(covid_agg, leftovers)
+covid_agg <- covid_agg[order(covid_agg$city),]
+
+##  get population data for cities
+colnames(census_pop)[1] <- "city"
+census_pop <- census_pop[-c(1,2),]
+## remove extraneous period at beginning
+census_pop$city <- gsub("[.]", "", census_pop$city)
+## match with small business data
+## match with hypen when possible, otherwise have to manually enter; when both metro area 
+## and metro divison exists, get rid of metro division
+census_pop$city2 <- gsub("-.*$", "", census_pop$city)
+addl_cities <- c("Cincinnati, OH","Columbus, OH Metro Area","Jacksonville, FL Metro Area","Kansas City, MO",
+                 "Louisville/Jefferson County, KY","Memphis, TN","Oklahoma City, OK Metro Area","Pittsburgh, PA Metro Area",
+                 "Richmond, VA Metro Area","Salt Lake City, UT Metro Area","St Louis, MO","Washington")
+census_pop_reduced <- census_pop[(census_pop$city2 %in% small_biz_dat$City | census_pop$city2 %in% addl_cities) & grepl("Area", census_pop$city),]
+## finish cleaning up names in order to merge
+census_pop_reduced$city2 <- gsub(",.*$", "", census_pop_reduced$city2)
+census_pop_reduced$city2[22] <- "Louisville"
+census_pop_reduced$city2[42] <- "St. Louis"
+census_pop_reduced$city2[51] <- "Washington DC"
+census_pop_reduced$city <- census_pop_reduced$city2
+colnames(census_pop_reduced)[13] <- "pop2019"
+## remove extraneous columns
+census_pop_reduced <- as.data.frame(dplyr::select(census_pop_reduced, c(city, pop2019)))
+
+
+## reshape small business data from wide to long
+colnames(small_biz_hrs)[1] <- "city"
+colnames(small_biz_open)[1] <- "city"
+colnames(small_biz_emp)[1] <- "city"
+small_biz_hrs_long <- gather(small_biz_hrs,key="date",value="hrs_pct",-city)
+small_biz_open_long <- gather(small_biz_open,key="date",value="open_pct",-city)
+small_biz_emp_long <- gather(small_biz_emp,key="date",value="emp_pct",-city)
+small_biz_hrs_long$date <- as.Date(as.numeric(small_biz_hrs_long$date), origin = "1899-12-30")
+small_biz_open_long$date <- as.Date(as.numeric(small_biz_open_long$date), origin = "1899-12-30")
+small_biz_emp_long$date <- as.Date(as.numeric(small_biz_emp_long$date), origin = "1899-12-30")
+
+## merge all small business and coronavirus case data on date and city
+master_df <- Reduce(function(x,y) merge(x,y, by=c('date', 'city')), list(covid_agg, small_biz_emp_long,
+                                                                         small_biz_hrs_long, small_biz_open_long))
+
+## merge on census data, keeping all entries
+master_df <- merge(master_df, census_pop_reduced, by='city', all = T)
+## standardize cases and deaths by population
+master_df$case_rate <- (master_df$total_cases / master_df$pop2019)*100000
+master_df$death_rate <- (master_df$total_deaths / master_df$pop2019)*100000
+
+## reformat dates
+master_df$date <- as.Date(master_df$date, origin = "1970-01-01")
+## remove NAs and manual remove of duplicated city 
+## (we performed sanity checks and determined that Portland, ME was being picked
+## up in addition to Portland, OR in our initial preprocessing)
+master_df <- na.omit(master_df)
+master_df <- master_df[master_df$pop2019 != 538500,]
+
+## create variables for new daily cases and deaths by city
+master_df <- master_df %>%
+    group_by(city) %>%
+    mutate(new_cases = total_cases - lag(total_cases),new_deaths=total_deaths-lag(total_deaths))
+## create variables for day-over-day changes in total cases and total deaths
+master_df$cases_dod <- master_df$new_cases/master_df$total_cases
+master_df$deaths_dod <- master_df$new_deaths/master_df$total_deaths
+
+## ----- Analysis -----
+
+## here, we perform an iterative analysis on the effects of small business closures
+## on coronavirus cases 
+## at each date, we look to cluster cities based on case rates - this is to determine and 
+## eliminate potential outliers (e.g. New York, Seattle)
+## optimal clusters are determined by silhouette width, and we set minimum cluster size to 4
+## we then use a regression of transformed and lagged coronavirus case data on small business closures 
+## cases are lagged 10 days in order to account for both the typical time frame in which 
+## symptoms begin to show, as well as the time it takes to process tests
+## transformations are made acccording to box cox
+## our most recent data is from 4/23 - using a 10 day lag we include data between 3/02 and 4/13
+
+## get dates at which to perform analysis
+analysis_dts <- unique(master_df$date[master_df$date <= "2020-04-12"])
+
+metrics_by_date <- list()
+## iterate through dates
+for (i in 1:length(analysis_dts)){
+  ## subset by date and future date (10 day lag)
+  date <- as.Date(analysis_dts[i], origin = "1970-01-01")
+  fut_date <- date + 10
+  data_date <- master_df[master_df$date == date,]
+  data_date_fut <- master_df[master_df$date == fut_date,]
+
+  ## create clusters by attempting 2-6 clusters
+  for(k in 2:6) {
+    set.seed(42)
+    ktest <- kmeans(data_date[,9:10],k)
+    ## get silhouette width
+    sil <- silhouette(ktest$cluster,dist(data_date[,9:10]))
+    t <- summary(sil)
+    ## check if cluster size is less than 4
+    ## if so, force the silhouette width to 0
+    if (any(ktest$size < 4)){
+      avg_clus_width[k-1] <- 0
+    } else {
+      avg_clus_width[k-1] <- mean(t$clus.avg.widths)
+    }
+  }
+  ## if there is at least one cluster that is not forced to 0 then
+  ## extract the optimal number of clusters based on max silhouette width
+  if (!all(avg_clus_width == 0)){
+    ## pick cluster w largest avg width
+    num_clusters <- which.max(avg_clus_width) + 1
+    ## rerun kmeans and extract clusters
+    kfinal <- kmeans(data_date[,9:10],num_clusters)
+    clusters <- kfinal$cluster
+  } else {
+    ## else, we have no clusters and we simply use all of the data
+    clusters <- rep(1, nrow(data_date))
+    num_clusters <- 1
+  }
+  
+  ## adding clusters and future data points to main dataset
+  data_date$clusters <- clusters
+  data_date$fut_cases <- data_date_fut$case_rate
+  data_date$fut_deaths <- data_date_fut$death_rate
+
+  ## we are interested in using the largest cluster
+  ## if more than one cluster, determine the largest and proceed with that
+  if(num_clusters > 1){
+    j <- which.max(kfinal$size)
+  } else {
+    j <- 1
+  }
+  ## run regression for each cluster
+  cluster_data <- data_date[data_date$clusters == j,]
+  ## add a small constant to zero values in order for boxcox to be later performed
+  cluster_data$fut_cases[cluster_data$fut_cases == 0] <- 0.00001
+  reg <- lm(cluster_data$fut_cases ~ cluster_data$open_pct)
+  ## transform y based on log-likelihood of lambdas from boxcox
+  bxcx <- MASS::boxcox(reg, plotit=F)
+  trans <- bxcx$x[which.max(bxcx$y)]
+  ## run transformed regression
+  trans_reg <- lm((cluster_data$fut_cases)^trans~cluster_data$open_pct)
+  ## extract mean and sd of lagged case data
+  avg_fut_case_rate <- mean(cluster_data$fut_cases)
+  sd_fut_case_rate <- sd(cluster_data$fut_cases)
+  ## extract coefficients and significance levels from transformed regression
+  sum_trans_reg <- summary(trans_reg)
+  coef <- sum_trans_reg$coefficients[2,1]
+  sig <- sum_trans_reg$coefficients[2,4]
+  ## extract cluster size
+  size <- nrow(cluster_data)
+  ## save metrics as a vector in a list 
+  metrics_by_date[[i]] <- c(avg_fut_case_rate, sd_fut_case_rate, coef, sig, size)
+  names(metrics_by_date[[i]]) <- c("mean", "sd", "beta", "p", "size")
+}
+
+## ----- Output -----
+
+## plot betas over time
+mean <- c()
+sd <- c()
+beta <- c()
+p <- c()
+size <- c()
+for(i in 1:length(metrics_by_date)) {
+  mean[i] <- metrics_by_date[[i]][1]
+  sd[i] <- metrics_by_date[[i]][2]
+  beta[i] <- metrics_by_date[[i]][3]
+  p[i] <- metrics_by_date[[i]][4]
+  size[i] <- metrics_by_date[[i]][5]
+}
+final_data <- data.frame(date = analysis_dts, mean = mean, sd = sd, beta = beta, p = p,size = size)
+## color by significance cutoffs
+final_data$pcolor <- 0
+for(i in 1:nrow(final_data)) {
+  if(final_data$p[i]>.1) {
+    final_data$pcolor[i]<-"> 0.10"
+  }
+  else if(final_data$p[i]<=.1&final_data$p[i]>.05) {
+    final_data$pcolor[i] <- "<= 0.10 & > 0.05"
+  }
+  else if(final_data$p[i]<=.05&final_data$p[i]>.01) {
+    final_data$pcolor[i] <- "<= 0.05 & > 0.01"
+  }
+  else if(final_data$p[i]<= .01) {
+    final_data$pcolor[i]<- "< 0.01"
+  }
+}
+
+final_data$pcolor <- as.factor(final_data$pcolor)
+final_plot <- ggplot(data = final_data, aes(x = date))+geom_line(aes(x=date,y=beta))+geom_point(aes(x=date,y=beta,colour=pcolor))+scale_x_date(date_breaks="1 week",date_labels="%b-%d")+xlab("Date")+ylab("Beta")+labs(title = "Regression Coefficient of COVID-19 Cases on Small Business Closures", colour = "P-Value") + theme(plot.title = element_text(hjust = 0.5))
+final_plot
+
+
+```
